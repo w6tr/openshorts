@@ -3635,6 +3635,8 @@ async def process_endpoint(
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
     analysis_only: Optional[str] = Form(None),
+    clips: Optional[str] = Form(None),
+    source_job_id: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3671,6 +3673,12 @@ async def process_endpoint(
         source_start = body.get("source_start")
         source_end = body.get("source_end")
         analysis_only_flag = bool(body.get("analysis_only"))
+        clips = body.get("clips")
+        source_job_id = body.get("source_job_id")
+
+    # Preset clips (form: a JSON string; JSON body: a list). Validated here so
+    # a bad list is a 400 now, not a failed job later.
+    preset_clips = _parse_preset_clips(clips)
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -3700,8 +3708,14 @@ async def process_endpoint(
     if upload_id and not url and not file and not thumb_session:
         upload_slot = _take_pending_upload(upload_id, await _owner_id(request))
 
-    if not url and not file and not thumb_session and not upload_slot:
-        raise HTTPException(status_code=400, detail="Must provide URL, File or upload_id")
+    # Reuse of an earlier job's source + transcript (e.g. an analysis_only
+    # job): same handover as a Thumbnail Studio session, read from disk.
+    source_job = None
+    if source_job_id and not url and not file and not thumb_session and not upload_slot:
+        source_job = await _source_job_handover(request, source_job_id)
+
+    if not url and not file and not thumb_session and not upload_slot and not source_job:
+        raise HTTPException(status_code=400, detail="Must provide URL, File, upload_id or source_job_id")
 
     # Completion callback: reject unsafe targets NOW (clear 400) — delivery
     # re-validates anyway, but failing at submit is the debuggable behavior.
@@ -3737,7 +3751,7 @@ async def process_endpoint(
         "user_agent": user_agent,
         "timestamp": time.time(),
         "source": ("thumbnail_session" if thumb_session else "upload_id" if upload_slot
-                   else "url" if url else "file"),
+                   else "source_job" if source_job else "url" if url else "file"),
     }
 
     job_id = str(uuid.uuid4())
@@ -3856,6 +3870,24 @@ async def process_endpoint(
             with open(transcript_path, "w") as f:
                 json.dump(thumb_session["transcript"], f)
             cmd.extend(["--transcript", transcript_path])
+    elif source_job:
+        # Same hardlink-or-copy handover as the session above, from the
+        # earlier job's files; its transcript rides along when it has words.
+        src = source_job["video_path"]
+        base = os.path.basename(src)
+        if base.startswith(f"{source_job['job_id']}_"):
+            base = base[len(source_job['job_id']) + 1:]
+        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{base}")
+        try:
+            os.link(src, input_path)
+        except OSError:
+            shutil.copyfile(src, input_path)
+        cmd.extend(["-i", input_path])
+        if (source_job.get("transcript") or {}).get("segments"):
+            transcript_path = os.path.join(job_output_dir, "source_transcript.json")
+            with open(transcript_path, "w") as f:
+                json.dump(source_job["transcript"], f)
+            cmd.extend(["--transcript", transcript_path])
     elif upload_slot:
         # Move the pre-uploaded file under the job's name so it is cleaned up
         # with the job like any other upload; the slot is consumed.
@@ -3899,6 +3931,12 @@ async def process_endpoint(
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
+    if preset_clips:
+        clips_path = os.path.join(job_output_dir, "preset_clips.json")
+        with open(clips_path, "w") as f:
+            json.dump(preset_clips, f)
+        cmd.extend(["--clips", clips_path])
+        print(f"[preset-clips] job={job_id} n={len(preset_clips)}")
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 
@@ -4135,6 +4173,68 @@ def _source_signature(job_id: str, exp: int) -> str:
 def _job_record(job_id: str):
     """The in-memory job record, or what the shared disk says about it."""
     return jobs.get(job_id) or _job_view_from_disk(job_id)
+
+
+def _parse_preset_clips(raw):
+    """Caller-chosen clips for /api/process: a list of {start, end,
+    hook_text?, title?} (form: JSON string). None when absent; 400 on bad
+    input rather than a job that fails after the download."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="clips must be a JSON list")
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="clips must be a non-empty list")
+    out = []
+    for i, c in enumerate(raw):
+        if not isinstance(c, dict):
+            raise HTTPException(status_code=400, detail=f"clips[{i}] must be an object")
+        try:
+            start, end = float(c.get("start")), float(c.get("end"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"clips[{i}] needs numeric start and end")
+        if not (0 <= start < end):
+            raise HTTPException(status_code=400, detail=f"clips[{i}] needs 0 <= start < end")
+        out.append({"start": start, "end": end,
+                    "hook_text": c.get("hook_text") or None,
+                    "title": c.get("title") or None})
+    return out
+
+
+def _source_job_transcript(job_id: str):
+    """The transcript an earlier job left on disk: metadata.json first (an
+    analysis_only job writes it there), else the transcript checkpoint."""
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    try:
+        for meta in glob.glob(os.path.join(job_dir, "*_metadata.json")):
+            with open(meta, 'r') as f:
+                t = json.load(f).get("transcript")
+            if t:
+                return t
+        ckpt = os.path.join(job_dir, ".transcript_checkpoint.json")
+        if os.path.exists(ckpt):
+            with open(ckpt, 'r') as f:
+                return json.load(f).get("transcript")
+    except Exception:
+        pass
+    return None
+
+
+async def _source_job_handover(request, source_job_id: str):
+    """Resolve `source_job_id` for /api/process: the earlier job must exist,
+    belong to the caller and still have its source file on disk."""
+    job = _job_record(source_job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="source_job_id not found")
+    await _assert_job_owner(request, job)
+    src = _locate_source(source_job_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Source video for source_job_id no longer on disk")
+    return {"job_id": source_job_id, "video_path": src,
+            "transcript": _source_job_transcript(source_job_id)}
 
 
 def _signed_source_url(job_id: str) -> str:

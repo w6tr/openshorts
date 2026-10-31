@@ -1911,6 +1911,42 @@ def clear_transcript_checkpoint(output_dir):
 CLIP_RETRY_PAUSE_SECONDS = float(os.environ.get("CLIP_RETRY_PAUSE_SECONDS", "10"))
 
 
+def load_preset_clips(path, transcript, video_duration):
+    """Caller-chosen clips (``--clips``, app.py ``clips``) in the shape
+    get_viral_clips returns, so the render loop needs no special case. The
+    file holds ``[{start, end, hook_text?, title?}, ...]`` in seconds.
+    Bounds snap to word edges within CLIP_MIN/MAX_SECONDS exactly like picked
+    clips; overlapping entries are kept (the caller chose them) and render in
+    the given order. A ``hook_text`` is burned as-is: ``hook_source`` marks
+    it so hook grounding does not rewrite it."""
+    with open(path, 'r') as f:
+        presets = json.load(f)
+    words = []
+    for seg in (transcript or {}).get('segments', []) or []:
+        for word in seg.get('words') or []:
+            words.append({'w': word['word'], 's': word['start'], 'e': word['end']})
+    min_secs, max_secs = clip_duration_bounds()
+    shorts = []
+    for i, p in enumerate(presets):
+        start, end = float(p['start']), float(p['end'])
+        s = {
+            'start': start, 'end': end, 'proposed': [start, end],
+            'source_window_id': None, 'predicted_score': len(presets) - i,
+            'video_description_for_tiktok': '', 'video_description_for_instagram': '',
+            'video_title_for_youtube_short': (p.get('title') or '').strip(),
+            'viral_hook_text': (p.get('hook_text') or '').strip(),
+            'why': 'preset: chosen by the caller',
+        }
+        if s['viral_hook_text']:
+            s['hook_source'] = 'caller'
+        if words:
+            s['start'], s['end'] = snap_clip_to_words(start, end, words, video_duration,
+                                                      min_duration=min_secs, max_duration=max_secs)
+        shorts.append(s)
+    print(f"⏩ Using {len(shorts)} preset clip(s) from {os.path.basename(path)} — skipping clip picking.")
+    return {'shorts': shorts}
+
+
 def clip_render_order(shorts):
     """Indices of ``shorts`` best-first by ``predicted_score`` (ties and
     unscored clips keep their original order, after the scored ones)."""
@@ -2347,6 +2383,9 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--clips', type=str,
+                        help="Path to a JSON list of preset clips [{start, end, hook_text, title}]; "
+                             "skips clip picking and renders exactly these.")
     parser.add_argument('--analysis-only', action='store_true',
                         help="Stop after the transcript and metadata are written (no clip picking, no render). "
                              "Same as ANALYSIS_ONLY=1.")
@@ -2430,6 +2469,7 @@ if __name__ == '__main__':
                              daemon=True).start()
 
         use_early = (not args.skip_analysis and not args.transcript and not analysis_only
+                     and not args.clips
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
@@ -2600,7 +2640,7 @@ if __name__ == '__main__':
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
-        if transcript is not None and speech_is_sparse(transcript, duration):
+        if transcript is not None and not args.clips and speech_is_sparse(transcript, duration):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
                   f"switching to visual analysis.")
@@ -2608,7 +2648,9 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
+        if args.clips:
+            clips_data = load_preset_clips(args.clips, transcript, duration)
+        elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
@@ -2679,7 +2721,8 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                    if (success and clip.get('hook_source') != 'caller'
+                            and hook_grounding.wanted(clip['layout_ranges'], end - start)):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                     captioned = None
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])
