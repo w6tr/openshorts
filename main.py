@@ -2347,9 +2347,13 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    parser.add_argument('--analysis-only', action='store_true',
+                        help="Stop after the transcript and metadata are written (no clip picking, no render). "
+                             "Same as ANALYSIS_ONLY=1.")
 
     args = parser.parse_args()
     output_format = args.format
+    analysis_only = args.analysis_only or os.environ.get("ANALYSIS_ONLY", "").strip() == "1"
 
     script_start_time = time.time()
 
@@ -2425,7 +2429,7 @@ if __name__ == '__main__':
             threading.Thread(target=_early_work, args=(audio_path, audio_duration),
                              daemon=True).start()
 
-        use_early = (not args.skip_analysis and not args.transcript
+        use_early = (not args.skip_analysis and not args.transcript and not analysis_only
                      and os.environ.get("EARLY_AUDIO", "1").strip() != "0"
                      and not os.environ.get("MAX_SOURCE_MINUTES", "").strip()
                      and not os.path.exists(os.path.join(output_dir, TRANSCRIPT_CHECKPOINT)))
@@ -2572,6 +2576,27 @@ if __name__ == '__main__':
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
             except NoAudioError as e:
                 print(f"🔇 {e} — switching to visual analysis.")
+
+        if analysis_only:
+            # ANALYSIS_ONLY=1 / --analysis-only: the caller only wanted the
+            # transcript. Write the metadata in its usual shape with no clips
+            # and stop here, keeping the checkpoint and the source on disk so
+            # a later job can reuse both (app.py `source_job_id`).
+            metadata = {
+                'shorts': [],
+                'transcript': transcript or {"language": "none", "segments": []},
+                'source_video': os.path.basename(input_video),
+                'output_format': output_format,
+                'duration': duration,
+            }
+            if source_subtitle_band:
+                metadata['source_subtitle_band'] = source_subtitle_band
+            metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f"   Saved metadata to {metadata_file}")
+            print("ANALYSIS_ONLY_DONE", flush=True)
+            sys.exit(0)
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.

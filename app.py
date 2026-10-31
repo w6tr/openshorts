@@ -3217,7 +3217,16 @@ async def run_job(job_id, job_data):
 
                 rendered, missing = _clips_actually_rendered(
                     job_id, output_dir, base_name, clips)
-                if not rendered:
+                if env.get("ANALYSIS_ONLY") == "1":
+                    # No clips by design: hand back the transcript and the
+                    # rest of the metadata (source_video, duration, ...).
+                    jobs[job_id]['result'] = {
+                        'clips': [],
+                        'transcript': data.get('transcript'),
+                        'metadata': {k: v for k, v in data.items()
+                                     if k not in ('transcript', 'shorts')},
+                    }
+                elif not rendered:
                     # Nothing to hand over: fail the job so _settle_reservation
                     # releases the minutes instead of committing them.
                     jobs[job_id]['status'] = 'failed'
@@ -3625,6 +3634,7 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    analysis_only: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3636,6 +3646,7 @@ async def process_endpoint(
 
     ack_flag = str(acknowledged).lower() in ("1", "true", "yes")
     force_low = str(force_low_quality).lower() in ("1", "true", "yes")
+    analysis_only_flag = str(analysis_only).lower() in ("1", "true", "yes")
 
     # Handle JSON body manually for URL payload
     content_type = request.headers.get("content-type", "")
@@ -3659,6 +3670,7 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        analysis_only_flag = bool(body.get("analysis_only"))
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -3748,6 +3760,13 @@ async def process_endpoint(
     # still dies before it renders anything -- the server starts and every job
     # fails instead. setdefault, so an explicit PYTHONIOENCODING still wins.
     env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    # Analysis only: main.py stops once the transcript and metadata are
+    # written (no clip picking, no render). run_job reads the same env flag
+    # to accept the clipless result instead of failing the job.
+    if analysis_only_flag:
+        env["ANALYSIS_ONLY"] = "1"
+        print(f"[analysis-only] job={job_id}")
 
     # Optional layouts are per job. The renderer reads these at import time in
     # the subprocess, so they must be set before Popen — same path WATERMARK
