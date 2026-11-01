@@ -121,6 +121,9 @@ export const effectSegmentSchema = z.object({
   brightness: z.number().min(0).max(3),
   contrast: z.number().min(0).max(3),
   saturate: z.number().min(0).max(3),
+  // Pop-culture tint: full-frame colour wash over the segment.
+  tint: z.enum(["red", "green"]).optional(),
+  tintOpacity: z.number().min(0).max(1).optional(),
 });
 
 export const effectsConfigSchema = z.object({

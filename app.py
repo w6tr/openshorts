@@ -4563,6 +4563,7 @@ async def _ensure_job_files(job_id: str, request: Request) -> bool:
 
 
 from editor import VideoEditor
+from fx import apply_fx as _apply_fx, list_sounds as _list_sounds, SFX_DIR as _SFX_DIR
 from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video, CAPTION_PRESETS
 from hooks import add_hook_to_video
 from translate import translate_video, get_supported_languages
@@ -4747,6 +4748,112 @@ async def edit_clip(
             await _metering.release_reservation(reservation_id)
         print(f"❌ Edit Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+class FxRequest(BaseModel):
+    job_id: str
+    clip_index: int
+    effects: List[Dict[str, Any]]
+    input_filename: Optional[str] = None
+
+
+@app.get("/api/clip/fx/sounds")
+async def list_fx_sounds():
+    """Names of the sound effects available to /api/clip/fx."""
+    return {"dir": _SFX_DIR, "sounds": sorted(_list_sounds().keys())}
+
+
+@app.post("/api/clip/fx")
+async def clip_fx(req: FxRequest, request: Request):
+    """Pop-culture FX pass: red/green full-frame tints and one-shot sound
+    effects, laid over a finished clip with FFmpeg (see fx.py). No AI call —
+    the caller supplies the effect list. Mirrors /api/edit's file handling:
+    strips burned captions first, puts them back after, delivers, persists."""
+    await _ensure_job_files(req.job_id, request)
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = jobs[req.job_id]
+    await _assert_job_owner(request, job)
+    if 'result' not in job or 'clips' not in job['result']:
+        raise HTTPException(status_code=400, detail="Job result not available")
+    if req.clip_index < 0 or req.clip_index >= len(job['result']['clips']):
+        raise HTTPException(status_code=400, detail="clip_index out of range")
+
+    try:
+        if req.input_filename:
+            filename = os.path.basename(req.input_filename)
+        else:
+            filename = job['result']['clips'][req.clip_index]['video_url'].split('/')[-1]
+        job_dir = os.path.join(OUTPUT_DIR, req.job_id)
+        input_path = os.path.join(job_dir, filename)
+        if not os.path.exists(input_path):
+            raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
+
+        clean_name = await asyncio.to_thread(_strip_burned_captions, job_dir, filename)
+        had_captions = clean_name != filename
+        if had_captions:
+            filename = clean_name
+            input_path = os.path.join(job_dir, clean_name)
+
+        fx_filename = f"fx_{filename}"
+        output_path = os.path.join(job_dir, fx_filename)
+
+        def run_fx():
+            safe_in = os.path.join(job_dir, f"temp_fxin_{req.job_id}.mp4")
+            safe_out = os.path.join(job_dir, f"temp_fxout_{req.job_id}.mp4")
+            shutil.copy(input_path, safe_in)
+            try:
+                result = _apply_fx(safe_in, safe_out, req.effects)
+                if os.path.exists(safe_out):
+                    shutil.move(safe_out, output_path)
+                return result
+            finally:
+                for p in (safe_in, safe_out):
+                    if os.path.exists(p):
+                        os.remove(p)
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, run_fx)
+
+        if had_captions:
+            recap = await loop.run_in_executor(
+                None, _reapply_captions, req.job_id, req.clip_index, output_path)
+            if recap:
+                fx_filename = os.path.basename(recap)
+
+        fx_filename = await _deliver(request, req.job_id, fx_filename)
+        new_video_url = f"/videos/{req.job_id}/{fx_filename}"
+
+        job['result']['clips'][req.clip_index]['video_url'] = new_video_url
+        try:
+            meta_files = glob.glob(os.path.join(OUTPUT_DIR, req.job_id, "*_metadata.json"))
+            if meta_files:
+                with open(meta_files[0], 'r') as f:
+                    meta = json.load(f)
+                shorts = meta.get('shorts', [])
+                if req.clip_index < len(shorts):
+                    shorts[req.clip_index]['video_url'] = new_video_url
+                    meta['shorts'] = shorts
+                    with open(meta_files[0], 'w') as f:
+                        json.dump(meta, f, indent=4)
+        except Exception as e:
+            print(f"⚠️ Failed to update metadata.json: {e}")
+
+        _archive_clip_edit_bg(req.job_id, req.clip_index, fx_filename)
+
+        return {
+            "success": True,
+            "new_video_url": new_video_url,
+            "applied": result["applied"],
+            "dropped": result["dropped"],
+            "changed": result["changed"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ FX Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 class CaptionWordIn(BaseModel):
     """One user-edited caption word, clip-relative ms — the same shape the

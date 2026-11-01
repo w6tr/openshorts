@@ -20,12 +20,18 @@ EFFECT_LIMITS = {
     "bw_moment":  {"zoom": False, "max_strength": 1.0,  "default_strength": 1.0},
     "flash":      {"zoom": False, "max_strength": 1.0,  "default_strength": 1.0},
     "vignette":   {"zoom": False, "max_strength": 1.0,  "default_strength": 1.0},
+    # Pop-culture tints: a short full-frame colour wash (red = wrong/fail,
+    # green = win). Strength is the overlay alpha.
+    "tint_red":   {"zoom": False, "max_strength": 0.6,  "default_strength": 0.35},
+    "tint_green": {"zoom": False, "max_strength": 0.6,  "default_strength": 0.35},
 }
 
 MAX_EDITS = 12
 MIN_EFFECT_SECONDS = 0.15
 MAX_ZOOM_SECONDS = 8.0
 FLASH_SECONDS = 0.15
+MAX_TINT_SECONDS = 1.0
+TINT_COLORS = {"tint_red": "0xFF2020", "tint_green": "0x20E060"}
 
 # Zoom window anchor: 45% of the height keeps headroom for faces (slightly
 # above center) instead of cropping equally from top and bottom.
@@ -60,6 +66,8 @@ def normalize_edits(edits, duration, has_captions=False):
             continue
         if limits["zoom"] and end - start > MAX_ZOOM_SECONDS:
             end = start + MAX_ZOOM_SECONDS
+        if effect_type in TINT_COLORS and end - start > MAX_TINT_SECONDS:
+            end = start + MAX_TINT_SECONDS
         try:
             strength = float(entry.get("strength") or 0.0)
         except (TypeError, ValueError):
@@ -143,6 +151,11 @@ def build_filter_string(edits, duration, fps, width, height, has_captions=False)
             color_filters.append(f"eq=brightness=0.35:enable='between(t,{start:.2f},{flash_end:.2f})'")
         elif entry["type"] == "vignette":
             color_filters.append(f"vignette=angle=PI/4.5:enable='between(t,{start:.2f},{end:.2f})'")
+        elif entry["type"] in TINT_COLORS:
+            color_filters.append(
+                f"drawbox=x=0:y=0:w=iw:h=ih:color={TINT_COLORS[entry['type']]}@{strength:.2f}"
+                f":t=fill:enable='between(t,{start:.2f},{end:.2f})'"
+            )
 
     parts = list(color_filters)
     if zoom_terms:

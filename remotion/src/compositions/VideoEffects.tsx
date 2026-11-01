@@ -23,6 +23,9 @@ export const VideoEffects: React.FC<VideoEffectsProps> = ({
   }
 
   const currentTimeSec = frame / fps;
+  const tintSeg = config.segments.find(
+    (s) => s.tint && currentTimeSec >= s.startSec && currentTimeSec < s.endSec,
+  );
   const { zoom, centerX, centerY, brightness, contrast, saturate } =
     getInterpolatedValues(config.segments, currentTimeSec, frame, fps);
 
@@ -52,6 +55,17 @@ export const VideoEffects: React.FC<VideoEffectsProps> = ({
       >
         {children}
       </div>
+      {tintSeg?.tint && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            pointerEvents: "none",
+            backgroundColor: tintSeg.tint === "red" ? "#FF2020" : "#20E060",
+            opacity: tintSeg.tintOpacity ?? 0.35,
+          }}
+        />
+      )}
     </div>
   );
 };
