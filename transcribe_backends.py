@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 
+import word_onsets
 from subtitles import (
     get_whisper_config,
     WHISPER_TRANSCRIBE_PARAMS,
@@ -244,11 +245,19 @@ def _transcribe_with_whisper(media_path):
         })
         text_parts.append(segment.text.strip())
 
-    return {
+    transcript = {
         "text": " ".join(part for part in text_parts if part),
         "language": info.language,
         "segments": out_segments,
     }
+    # Whisper starts a word after a pause where the last one ended; move those
+    # starts to the speech so captions and beats land on the word.
+    if word_onsets.enabled():
+        try:
+            word_onsets.snap_transcript(transcript, media_path)
+        except Exception as e:
+            print(f"⚠️ [ASR] word onset snap skipped ({type(e).__name__}: {e})")
+    return transcript
 
 
 # --- parakeet ---------------------------------------------------------------
