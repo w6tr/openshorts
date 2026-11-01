@@ -285,6 +285,12 @@ CAPTION_PRESETS = {
               "highlight_color": "#FFFFFF", "border_width": 0, "shadow": 2,
               "effect": "none", "uppercase": False, "base_opacity": 0.7,
               "max_chars": 12},
+    # Quiet karaoke: short groups, the active word only a shade warmer, no
+    # pop. ClipBot's default (auto_caption_preset="calm").
+    "calm": {**_PRESET_BASE, "font_name": "Anton", "font_size": 40,
+             "highlight_color": "#FFF3B0", "border_width": 3, "effect": "none",
+             "uppercase": False, "base_opacity": 0.9, "max_chars": 12,
+             "max_duration": 1.2},
 }
 
 # Characters per line at font size 44, per font (Anton is condensed,

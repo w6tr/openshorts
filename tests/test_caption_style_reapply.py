@@ -123,3 +123,20 @@ def test_restyle_names_the_output_like_auto_captions(tmp_path, monkeypatch):
 def test_recut_captioner_only_with_a_recorded_style():
     assert app_module._recut_captioner({}) is None
     assert callable(app_module._recut_captioner({"caption_style": STYLE}))
+
+
+def test_job_caption_preset_is_reburned(tmp_path, monkeypatch):
+    # A render with a caption preset (e.g. "calm") keeps it when an edit
+    # re-burns: the preset only lives in the render's env, so the job records it.
+    job_id, video = _job(tmp_path, monkeypatch, {"start": 10.0, "end": 12.0})
+    meta = tmp_path / job_id / "base_metadata.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text()),
+                                "caption_preset": "calm"}))
+    import sys
+    import types
+    seen = []
+    fake_main = types.SimpleNamespace(
+        auto_caption_clip=lambda *a, **k: seen.append(k) or "auto.mp4")
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+    assert app_module._reapply_captions(job_id, 0, video) == "auto.mp4"
+    assert seen[0]["preset"] == "calm"

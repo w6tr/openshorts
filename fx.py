@@ -7,7 +7,9 @@ Effect dicts accepted by apply_fx():
     {"type": "sfx",  "sound": "<name in assets/sfx>", "at": s, "gain": 0..2}
 
 Hard caps: 12 tints, 12 sounds, tints 0.2-1.0 s long, tint alpha <= 0.6,
-sound gain <= 2.0. Anything outside the caps is clamped or dropped and the
+sound gain <= 2.0. A tint fades in over two frames and out over 0.3 s (a hard
+on/off box reads as machine-made), and sounds default to gain 0.3 (about
+-10 dB) so they sit under the voice. Anything outside the caps is clamped or dropped and the
 caller is told which.
 """
 import os
@@ -26,9 +28,12 @@ MAX_TINTS = 12
 MIN_TINT_SECONDS = 0.2
 MAX_TINT_SECONDS = 1.0
 DEFAULT_TINT_SECONDS = 0.5
-DEFAULT_TINT_ALPHA = 0.35
+DEFAULT_TINT_ALPHA = 0.2
 MAX_TINT_ALPHA = 0.6
 MAX_GAIN = 2.0
+DEFAULT_GAIN = 0.3
+TINT_FADE_IN = 0.07
+TINT_FADE_OUT = 0.3
 FFMPEG_TIMEOUT = 1800
 
 TINT_COLORS = {"red": "0xFF2020", "green": "0x20E060"}
@@ -116,7 +121,7 @@ def normalize_effects(effects, duration, sounds=None):
                 dropped.append({"effect": raw, "reason": "sfx needs an 'at' time"})
                 continue
             at = max(0.0, min(at, max(0.0, duration - 0.05)))
-            gain = _num(raw.get("gain"), 1.0) or 1.0
+            gain = _num(raw.get("gain"), DEFAULT_GAIN)
             gain = max(0.0, min(gain, MAX_GAIN))
             sfx.append({"sound": sound, "path": sounds[sound], "at": at, "gain": gain})
 
@@ -144,12 +149,21 @@ def build_fx_command(input_path, output_path, tints, sfx, has_audio, duration):
 
     filters = []
     if tints:
-        chain = ",".join(
-            f"drawbox=x=0:y=0:w=iw:h=ih:color={TINT_COLORS[t['color']]}@{t['alpha']:.2f}:t=fill"
-            f":enable='between(t,{t['start']:.2f},{t['end']:.2f})'"
-            for t in tints
-        )
-        filters.append(f"[0:v]{chain}[v]")
+        # One solid-colour copy of the frame per tint, its alpha faded in and
+        # out, laid over the picture only inside the tint's window.
+        n = len(tints)
+        filters.append(f"[0:v]split={n + 1}[t0]" + "".join(f"[c{k}]" for k in range(1, n + 1)))
+        for k, t in enumerate(tints, 1):
+            fin = min(TINT_FADE_IN, (t["end"] - t["start"]) / 2)
+            fout = min(TINT_FADE_OUT, t["end"] - t["start"] - fin)
+            filters.append(
+                f"[c{k}]drawbox=x=0:y=0:w=iw:h=ih:color={TINT_COLORS[t['color']]}@1:t=fill,"
+                f"format=rgba,colorchannelmixer=aa={t['alpha']:.2f},"
+                f"fade=t=in:st={t['start']:.3f}:d={fin:.3f}:alpha=1,"
+                f"fade=t=out:st={t['end'] - fout:.3f}:d={fout:.3f}:alpha=1[k{k}]")
+            out = "[v]" if k == n else f"[t{k}]"
+            filters.append(f"[t{k - 1}][k{k}]overlay=format=auto"
+                           f":enable='between(t,{t['start']:.3f},{t['end']:.3f})'{out}")
 
     if sfx:
         base = f"[{bed_index}:a]" if bed_index is not None else "[0:a]"

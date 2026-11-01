@@ -1181,7 +1181,8 @@ def _reapply_captions(job_id, clip_index, video_path):
                                      clip['caption_style'],
                                      clip.get('layout_ranges'))
         import main as _main
-        return _main.auto_caption_clip(video_path, transcript, start, end)
+        return _main.auto_caption_clip(video_path, transcript, start, end,
+                                       preset=data.get('caption_preset'))
     except Exception as e:
         print(f"⚠️  Could not re-apply captions to {video_path}: {e}")
         return None
@@ -3628,6 +3629,7 @@ async def process_endpoint(
     clip_max_seconds: Optional[str] = Form(None),
     auto_hook: Optional[str] = Form(None),
     auto_hook_style: Optional[str] = Form(None),
+    auto_caption_preset: Optional[str] = Form(None),
     thumbnail_session_id: Optional[str] = Form(None),
     captions: Optional[str] = Form(None),
     upload_id: Optional[str] = Form(None),
@@ -3666,6 +3668,7 @@ async def process_endpoint(
         clip_max_seconds = body.get("clip_max_seconds")
         auto_hook = body.get("auto_hook")
         auto_hook_style = body.get("auto_hook_style")
+        auto_caption_preset = body.get("auto_caption_preset")
         thumbnail_session_id = body.get("thumbnail_session_id")
         captions = body.get("captions")
         upload_id = body.get("upload_id")
@@ -3841,6 +3844,11 @@ async def process_endpoint(
     if captions is not None and str(captions).lower() in ("0", "false", "no"):
         env["AUTO_CAPTIONS"] = "0"
         print(f"[captions] job={job_id} auto-captions off")
+    else:
+        from subtitles import CAPTION_PRESETS
+        if auto_caption_preset in CAPTION_PRESETS:
+            env["AUTO_CAPTION_PRESET"] = auto_caption_preset
+            print(f"[captions] job={job_id} preset={auto_caption_preset}")
 
     input_path = None
     if url:
