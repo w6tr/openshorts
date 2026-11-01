@@ -870,6 +870,11 @@ def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                                        cap_minutes=cap_minutes, route_out=route_out)
 
 
+# Written by ClipBot with `docker cp` (see ClipBot's clipbot/login.py); read only
+# when YOUTUBE_COOKIES is unset.
+CLIPBOT_COOKIES_PATH = "/tmp/clipbot-youtube-cookies.txt"
+
+
 def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                             cap_minutes=None, route_out=None):
     """
@@ -919,6 +924,13 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
+    elif os.path.isfile(CLIPBOT_COOKIES_PATH):
+        # ClipBot (the CEO's clip bot on the host) copies the YouTube login
+        # read from the host's Firefox here before each job, so downloads run
+        # logged in to the CEO's Premium account. A container-only path, never
+        # the bind-mounted /app, so the login never lands in the repo folder.
+        cookies_path = CLIPBOT_COOKIES_PATH
+        print(f"🍪 Using the YouTube login ClipBot copied in ({os.path.getsize(cookies_path)} bytes).")
     else:
         cookies_path = None
         print("⚠️ YOUTUBE_COOKIES env var not found.")
