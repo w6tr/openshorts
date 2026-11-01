@@ -4806,12 +4806,22 @@ async def clip_fx(req: FxRequest, request: Request):
         fx_filename = f"fx_{filename}"
         output_path = os.path.join(job_dir, fx_filename)
 
+        # A zoom would crop whatever is still burned into the picture: no
+        # zooms at all over captions that could not be stripped, and none
+        # inside the hook's window (the hook is not stripped here).
+        zoom_after = 0.0
+        if re.match(r'^(?:fx_)*subtitled_\d+_', filename):
+            zoom_after = float('inf')
+        elif re.match(r'^(?:fx_)*(?:hooked_\d+_|hook_)', filename):
+            hook = job['result']['clips'][req.clip_index].get('auto_hook') or {}
+            zoom_after = float(hook.get('duration_seconds') or 5.0)
+
         def run_fx():
             safe_in = os.path.join(job_dir, f"temp_fxin_{req.job_id}.mp4")
             safe_out = os.path.join(job_dir, f"temp_fxout_{req.job_id}.mp4")
             shutil.copy(input_path, safe_in)
             try:
-                result = _apply_fx(safe_in, safe_out, req.effects)
+                result = _apply_fx(safe_in, safe_out, req.effects, zoom_after)
                 if os.path.exists(safe_out):
                     shutil.move(safe_out, output_path)
                 return result
