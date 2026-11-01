@@ -1054,17 +1054,95 @@ def _strip_burned_captions(output_dir, filename, materialize=True):
         filename = under
 
 
+FX_RECIPE_PREFIX = ".fxrecipe_"
+# A hook burned in under zero or more fx passes: (fx_)*hooked_<ts>_X.
+_HOOK_UNDER_FX = re.compile(r'^((?:fx_)*)(?:hooked_\d+_|hook_)(.+)$')
+
+
+def _fx_recipe_path(output_dir, name):
+    return os.path.join(output_dir, f"{FX_RECIPE_PREFIX}{name}.json")
+
+
+def _hook_free_twin(name):
+    """``(fx_)*hooked_<ts>_X`` -> ``(fx_)*X``: the same picture without its
+    hook layer. None when no hook heads the name (under its fx passes)."""
+    m = _HOOK_UNDER_FX.match(name)
+    return m.group(1) + m.group(2) if m else None
+
+
+def _keep_hook_free_fx(output_dir, fx_input, fx_output, effects, zoom_after):
+    """After an fx pass over a hooked picture, record how to make the same
+    pass without the hook (``fx_<twin>``), so a hook redo can start from a
+    clean picture instead of stacking on the old hook. Lazy: only a recipe
+    is written; _materialize_fx encodes it when a redo needs it. A stale
+    encode from an earlier pass is removed so it is never reused."""
+    twin = _hook_free_twin(fx_input)
+    if not twin or not (os.path.exists(os.path.join(output_dir, twin))
+                        or os.path.exists(_fx_recipe_path(output_dir, twin))):
+        return None
+    name = f"fx_{twin}"
+    assert name == _hook_free_twin(fx_output)
+    stale = os.path.join(output_dir, name)
+    if os.path.exists(stale):
+        os.remove(stale)
+    with open(_fx_recipe_path(output_dir, name), "w") as f:
+        json.dump({"source": twin, "effects": effects, "zoom_after": zoom_after}, f)
+    return name
+
+
+def _materialize_fx(output_dir, name):
+    """True when ``name`` is on disk afterwards, encoding it (and, first,
+    its source) from an fx recipe left by _keep_hook_free_fx. Encodes:
+    call it off the event loop."""
+    path = os.path.join(output_dir, name)
+    if os.path.exists(path):
+        return True
+    try:
+        with open(_fx_recipe_path(output_dir, name)) as f:
+            r = json.load(f)
+        source = os.path.basename(r["source"])
+        effects, zoom_after = r["effects"], float(r.get("zoom_after") or 0.0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not _materialize_fx(output_dir, source):
+        return False
+    part = uuid.uuid4().hex[:8]
+    safe_in = os.path.join(output_dir, f".part_in_{part}.mp4")
+    safe_out = os.path.join(output_dir, f".part_{part}.mp4")
+    try:
+        shutil.copy(os.path.join(output_dir, source), safe_in)
+        _apply_fx(safe_in, safe_out, effects, zoom_after)
+        if not os.path.exists(safe_out):
+            return False
+        os.replace(safe_out, path)
+        return True
+    except Exception as e:
+        print(f"⚠️ Could not encode {name} from its fx recipe: {e}")
+        return False
+    finally:
+        for p in (safe_in, safe_out):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def _strip_burned_hook(output_dir, filename):
     """Walk ``hooked_<ts>_`` (and legacy ``hook_``) prefixes back to the file
-    without a burned hook. Same fail-safe contract as _strip_burned_captions:
-    the name is returned unchanged when there is nothing to strip or the
-    underlying file is gone."""
+    without a burned hook, through any fx passes laid over the hook
+    (``fx_hooked_<ts>_X`` -> ``fx_X``, encoded from its fx recipe if need
+    be). Same fail-safe contract as _strip_burned_captions: the name is
+    returned unchanged when there is nothing to strip or the hook-free file
+    is gone. Encodes: call it off the event loop."""
     filename = _strip_watermark_copy(output_dir, filename)
     while True:
-        m = re.match(r'^(?:hooked_\d+_|hook_)(.+)$', filename)
-        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
+        under = _hook_free_twin(filename)
+        if not under or not _materialize_fx(output_dir, under):
             return filename
-        filename = m.group(1)
+        filename = under
+
+
+def _hook_still_burned(filename):
+    """True when a hook is still in the picture under its fx passes."""
+    return _hook_free_twin(filename) is not None
 
 
 async def _deliver(request, job_id, filename):
@@ -4824,6 +4902,7 @@ async def clip_fx(req: FxRequest, request: Request):
                 result = _apply_fx(safe_in, safe_out, req.effects, zoom_after)
                 if os.path.exists(safe_out):
                     shutil.move(safe_out, output_path)
+                    _keep_hook_free_fx(job_dir, filename, fx_filename, req.effects, zoom_after)
                 return result
             finally:
                 for p in (safe_in, safe_out):
@@ -6211,7 +6290,15 @@ async def add_hook(req: HookRequest, request: Request):
     # one) instead of stacking on top of it.
     clean_name = _strip_burned_captions(output_dir, filename, materialize=False)
     had_captions = clean_name != filename
-    clean_name = _strip_burned_hook(output_dir, clean_name)
+    clean_name = await asyncio.to_thread(_strip_burned_hook, output_dir, clean_name)
+    if _hook_still_burned(clean_name):
+        # A clip fx'd before hook-free copies were kept: its old hook is
+        # baked under the fx pass and cannot be taken off. Refuse rather
+        # than stack a second hook over it; nothing is changed.
+        raise HTTPException(status_code=409, detail=(
+            "Hook redo refused: the old hook is baked in under this clip's sounds/tints/zooms "
+            "and it has no hook-free copy (made before the fix), so a new hook would sit on "
+            "top of it. Nothing was changed."))
     filename = clean_name
     input_path = os.path.join(output_dir, clean_name)
 
